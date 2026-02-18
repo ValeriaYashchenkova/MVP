@@ -1,10 +1,12 @@
 # run_test.py
 import os
-import subprocess
 import sys
+import subprocess
 import getpass
 import keyring
 import git
+import datetime
+import webbrowser
 try:
     import tomllib
 except ImportError:
@@ -36,106 +38,163 @@ def get_db_credentials(config):
 
 def checkout_and_pull_branch(repo, branch_name, default_branch):
     repo.remotes.origin.fetch()
-    
     remote_branches = {ref.name.split('/')[-1] for ref in repo.remotes.origin.refs}
     
     if branch_name not in remote_branches:
-        print(f"Ветка '{branch_name}' не найдена в удалённом репозитории")
-        print("Доступные ветки:", ", ".join(sorted(remote_branches)) if remote_branches else "— пусто —")
+        print(f"Ветка '{branch_name}' не найдена")
+        print("Доступные:", ", ".join(sorted(remote_branches)) or "— пусто —")
         sys.exit(1)
     
-    print(f"Переключаемся на ветку: {branch_name}")
+    print(f"→ checkout {branch_name}")
     repo.git.checkout(branch_name)
-    
-    print(f"Подтягиваем изменения из origin/{branch_name}")
+    print(f"→ pull origin/{branch_name}")
     repo.git.pull('origin', branch_name)
+
+def parse_pytest_output(output):
+    """Простой парсер вывода pytest для извлечения результатов"""
+    lines = output.splitlines()
+    results = []
+    current_test = None
+    
+    for line in lines:
+        line = line.strip()
+        if line.startswith("test_") and "::" in line:
+            current_test = line.split("::")[-1].split()[0]
+        elif line.startswith("PASSED") and current_test:
+            results.append({"name": current_test, "status": "PASSED", "message": ""})
+            current_test = None
+        elif line.startswith("FAILED") and current_test:
+            # ищем сообщение об ошибке (следующая строка часто содержит детали)
+            msg = ""
+            for next_line in lines[lines.index(line)+1:]:
+                if next_line.strip() and not next_line.startswith(" "):
+                    break
+                msg += next_line.strip() + " "
+            results.append({"name": current_test, "status": "FAILED", "message": msg.strip()})
+            current_test = None
+        elif line.startswith("ERROR") and current_test:
+            results.append({"name": current_test, "status": "ERROR", "message": "Ошибка выполнения"})
+            current_test = None
+    
+    return results
+
+def generate_html_report(results, branch_name):
+    timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    html = f"""<!DOCTYPE html>
+<html lang="ru">
+<head>
+    <meta charset="UTF-8">
+    <title>Отчёт по проверке дубликатов — {branch_name}</title>
+    <style>
+        body {{ font-family: Arial, sans-serif; margin: 40px; }}
+        h1 {{ color: #333; }}
+        table {{ border-collapse: collapse; width: 100%; max-width: 900px; }}
+        th, td {{ border: 1px solid #ddd; padding: 12px; text-align: left; }}
+        th {{ background-color: #f2f2f2; }}
+        .passed {{ background-color: #d4edda; color: #155724; }}
+        .failed {{ background-color: #f8d7da; color: #721c24; }}
+        .error  {{ background-color: #fff3cd; color: #856404; }}
+        pre {{ white-space: pre-wrap; font-family: monospace; }}
+    </style>
+</head>
+<body>
+    <h1>Отчёт по тестам на дубликаты</h1>
+    <p>Ветка: <strong>{branch_name}</strong><br>
+       Дата: {timestamp}<br>
+       Всего тестов: {len(results)}</p>
+    
+    <table>
+        <tr>
+            <th>Тест</th>
+            <th>Статус</th>
+            <th>Сообщение / Детали</th>
+        </tr>
+"""
+    for r in results:
+        cls = r["status"].lower()
+        msg = r["message"] or "—"
+        html += f"""        <tr>
+            <td>{r["name"]}</td>
+            <td class="{cls}"><strong>{r["status"]}</strong></td>
+            <td><pre>{msg}</pre></td>
+        </tr>\n"""
+    
+    html += """    </table>
+</body>
+</html>"""
+    return html
 
 def main():
     config = load_config()
     repo_path = config["repository"]["local_path"]
     
     if not os.path.exists(repo_path):
-        print(f"Локальный репозиторий не найден: {repo_path}")
-        print("Сначала запустите generate_test.py чтобы склонировать репозиторий")
+        print("Репозиторий не найден. Запустите generate_test.py сначала.")
         sys.exit(1)
     
     repo = git.Repo(repo_path)
     
-    print("=== Запуск тестов с ветки ===\n")
+    print("=== Запуск тестов и генерация простого отчёта ===\n")
     
-    branch_name = input("Название ветки для запуска тестов: ").strip()
+    branch_name = input("Название ветки: ").strip()
     if not branch_name:
-        print("Ветка не указана → выход")
         return
     
-    # Переключаемся на нужную ветку
     checkout_and_pull_branch(repo, branch_name, config["repository"]["default_branch"])
     
-    # Путь к директории с тестами
     tests_dir = os.path.join(repo_path, config["tests"]["tests_directory"])
-    
     if not os.path.exists(tests_dir):
-        print(f"Директория с тестами не найдена: {tests_dir}")
+        print(f"Папка тестов не найдена: {tests_dir}")
         return
     
-    # Собираем все .py файлы в tests/
-    test_files = [f for f in os.listdir(tests_dir) if f.endswith('.py') and f.startswith(config["tests"]["test_file_prefix"])]
-    
-    if not test_files:
-        print(f"Тесты не найдены в {tests_dir}")
-        print("Ожидаемые файлы начинаются с:", config["tests"]["test_file_prefix"])
-        return
-    
-    print(f"Найдено тестов: {len(test_files)}")
-    for tf in test_files:
-        print(f"  • {tf}")
-    
-    print("\nПродолжить запуск? [Y/n]")
-    if input().strip().lower() in ('n', 'no'):
-        return
-    
-    # Получаем credentials БД
     user, password = get_db_credentials(config)
     
     env = os.environ.copy()
     env["DB_USER"] = user
     env["DB_PASS"] = password
-    # env["DB_DSN"] = ...  # если нужно переопределить — берётся из config в тестах
     
-    allure_results = config["allure"]["results_dir"]
-    os.makedirs(allure_results, exist_ok=True)
-    
-    print("\nЗапускаю pytest на всех тестах ветки...\n")
+    print("\nЗапускаю pytest...\n")
     
     try:
-        cmd = [
-            "pytest",
-            "--alluredir", allure_results,
-            os.path.join(tests_dir, "*.py")   # запуск всех .py файлов в директории
-        ]
-        
         result = subprocess.run(
-            cmd,
+            ["pytest", tests_dir],
             env=env,
             capture_output=True,
             text=True,
-            cwd=repo_path   # важно — pytest запускается из корня репозитория
+            cwd=repo_path
         )
         
         print(result.stdout)
         if result.stderr:
-            print("\nstderr:\n" + result.stderr)
+            print("\nОшибки/логи:\n" + result.stderr)
         
         print(f"\nКод возврата: {result.returncode}")
-        print("Все тесты пройдены ✓" if result.returncode == 0 else "Есть проваленные тесты ✗")
         
-        print(f"\nПросмотр Allure-отчёта:")
-        print(f"  allure serve {allure_results}")
+        # Парсим результаты
+        test_results = parse_pytest_output(result.stdout + "\n" + result.stderr)
+        
+        if not test_results:
+            print("Не удалось распознать результаты тестов (возможно, pytest упал слишком рано)")
+            print("Сохраняем сырой вывод в raw_output.txt")
+            with open("raw_output.txt", "w", encoding="utf-8") as f:
+                f.write(result.stdout + "\n\n" + result.stderr)
+            return
+        
+        # Генерируем HTML
+        html_content = generate_html_report(test_results, branch_name)
+        report_path = "test_report.html"
+        
+        with open(report_path, "w", encoding="utf-8") as f:
+            f.write(html_content)
+        
+        print(f"\nОтчёт сохранён: {report_path}")
+        print("Открываю в браузере...")
+        webbrowser.open(f"file://{os.path.abspath(report_path)}")
     
     except FileNotFoundError:
-        print("pytest не найден → выполните: pip install pytest allure-pytest")
+        print("pytest не найден → pip install pytest")
     except Exception as e:
-        print(f"Ошибка при запуске pytest: {e}")
+        print(f"Ошибка при запуске: {e}")
 
 if __name__ == "__main__":
     main()
