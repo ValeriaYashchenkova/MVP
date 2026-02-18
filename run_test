@@ -3,47 +3,62 @@ import os
 import subprocess
 import getpass
 import keyring
+import sys
+try:
+    import tomllib
+except ImportError:
+    import tomli as tomllib
 
-DB_SERVICE = "oracle_almtst1"
+CONFIG_FILE = "config.toml"
 
-def get_db_credentials():
-    user = keyring.get_password(DB_SERVICE, "username")
-    password = keyring.get_password(DB_SERVICE, "password")
+def load_config():
+    if not os.path.exists(CONFIG_FILE):
+        print(f"Конфиг {CONFIG_FILE} не найден!")
+        sys.exit(1)
+    with open(CONFIG_FILE, "rb") as f:
+        return tomllib.load(f)
+
+def get_db_credentials(config):
+    service = config["database"]["db_service_name"]
+    user = keyring.get_password(service, "username")
+    password = keyring.get_password(service, "password")
     
     if not user:
         user = input("Логин БД: ")
-        keyring.set_password(DB_SERVICE, "username", user)
+        keyring.set_password(service, "username", user)
     
     if not password:
         password = getpass.getpass("Пароль БД: ")
-        keyring.set_password(DB_SERVICE, "password", password)
+        keyring.set_password(service, "password", password)
     
     return user, password
 
 def main():
+    config = load_config()
+    
     print("=== Запуск теста на дубликаты ===\n")
     
-    test_file = input("Имя файла теста (tests/test_duplicates_....py): ").strip()
-    if not test_file.startswith("tests/"):
-        test_file = f"tests/{test_file}"
+    test_file = input("Имя файла теста (например test_duplicates_xxx.py): ").strip()
+    if not test_file.startswith(config["tests"]["tests_directory"] + "/"):
+        test_file = f"{config['tests']['tests_directory']}/{test_file}"
     
-    full_test_path = os.path.join("./bialm_ft_auto", test_file)
+    full_test_path = os.path.join(config["repository"]["local_path"], test_file)
     
     if not os.path.exists(full_test_path):
         print(f"Файл не найден: {full_test_path}")
         return
     
-    user, password = get_db_credentials()
+    user, password = get_db_credentials(config)
     
     env = os.environ.copy()
     env["DB_USER"] = user
     env["DB_PASS"] = password
-    # env["DB_DSN"] = "..."  # если нужно переопределить DSN
+    # env["DB_DSN"] = config["database"]["default_dsn"]  # если нужно переопределить
     
-    allure_results = "./allure-results"
+    allure_results = config["allure"]["results_dir"]
     os.makedirs(allure_results, exist_ok=True)
     
-    print("\nЗапускаю pytest...\n")
+    print("\nЗапуск pytest...\n")
     
     try:
         result = subprocess.run(
@@ -59,22 +74,17 @@ def main():
         
         print(result.stdout)
         if result.stderr:
-            print("\nОшибки/логи stderr:")
-            print(result.stderr)
+            print("\nstderr:\n" + result.stderr)
         
         print(f"\nКод возврата: {result.returncode}")
-        if result.returncode == 0:
-            print("Тест пройден ✓")
-        else:
-            print("Тест НЕ пройден ✗")
+        print("OK ✓" if result.returncode == 0 else "Провал ✗")
         
-        print("\nЧтобы посмотреть отчёт:")
-        print("  allure serve ./allure-results")
+        print(f"\nПросмотр отчёта: allure serve {allure_results}")
     
     except FileNotFoundError:
-        print("pytest не найден. Установите:  pip install pytest allure-pytest")
+        print("pytest не найден → pip install pytest allure-pytest")
     except Exception as e:
-        print(f"Ошибка при запуске: {e}")
+        print(f"Ошибка запуска: {e}")
 
 if __name__ == "__main__":
     main()
