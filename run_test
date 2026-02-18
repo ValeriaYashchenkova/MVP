@@ -1,9 +1,10 @@
 # run_test.py
 import os
 import subprocess
+import sys
 import getpass
 import keyring
-import sys
+import git
 try:
     import tomllib
 except ImportError:
@@ -24,52 +25,101 @@ def get_db_credentials(config):
     password = keyring.get_password(service, "password")
     
     if not user:
-        user = input("Логин БД: ")
+        user = input(f"Логин БД ({service}): ")
         keyring.set_password(service, "username", user)
     
     if not password:
-        password = getpass.getpass("Пароль БД: ")
+        password = getpass.getpass(f"Пароль БД ({service}): ")
         keyring.set_password(service, "password", password)
     
     return user, password
 
+def checkout_and_pull_branch(repo, branch_name, default_branch):
+    repo.remotes.origin.fetch()
+    
+    remote_branches = {ref.name.split('/')[-1] for ref in repo.remotes.origin.refs}
+    
+    if branch_name not in remote_branches:
+        print(f"Ветка '{branch_name}' не найдена в удалённом репозитории")
+        print("Доступные ветки:", ", ".join(sorted(remote_branches)) if remote_branches else "— пусто —")
+        sys.exit(1)
+    
+    print(f"Переключаемся на ветку: {branch_name}")
+    repo.git.checkout(branch_name)
+    
+    print(f"Подтягиваем изменения из origin/{branch_name}")
+    repo.git.pull('origin', branch_name)
+
 def main():
     config = load_config()
+    repo_path = config["repository"]["local_path"]
     
-    print("=== Запуск теста на дубликаты ===\n")
+    if not os.path.exists(repo_path):
+        print(f"Локальный репозиторий не найден: {repo_path}")
+        print("Сначала запустите generate_test.py чтобы склонировать репозиторий")
+        sys.exit(1)
     
-    test_file = input("Имя файла теста (например test_duplicates_xxx.py): ").strip()
-    if not test_file.startswith(config["tests"]["tests_directory"] + "/"):
-        test_file = f"{config['tests']['tests_directory']}/{test_file}"
+    repo = git.Repo(repo_path)
     
-    full_test_path = os.path.join(config["repository"]["local_path"], test_file)
+    print("=== Запуск тестов с ветки ===\n")
     
-    if not os.path.exists(full_test_path):
-        print(f"Файл не найден: {full_test_path}")
+    branch_name = input("Название ветки для запуска тестов: ").strip()
+    if not branch_name:
+        print("Ветка не указана → выход")
         return
     
+    # Переключаемся на нужную ветку
+    checkout_and_pull_branch(repo, branch_name, config["repository"]["default_branch"])
+    
+    # Путь к директории с тестами
+    tests_dir = os.path.join(repo_path, config["tests"]["tests_directory"])
+    
+    if not os.path.exists(tests_dir):
+        print(f"Директория с тестами не найдена: {tests_dir}")
+        return
+    
+    # Собираем все .py файлы в tests/
+    test_files = [f for f in os.listdir(tests_dir) if f.endswith('.py') and f.startswith(config["tests"]["test_file_prefix"])]
+    
+    if not test_files:
+        print(f"Тесты не найдены в {tests_dir}")
+        print("Ожидаемые файлы начинаются с:", config["tests"]["test_file_prefix"])
+        return
+    
+    print(f"Найдено тестов: {len(test_files)}")
+    for tf in test_files:
+        print(f"  • {tf}")
+    
+    print("\nПродолжить запуск? [Y/n]")
+    if input().strip().lower() in ('n', 'no'):
+        return
+    
+    # Получаем credentials БД
     user, password = get_db_credentials(config)
     
     env = os.environ.copy()
     env["DB_USER"] = user
     env["DB_PASS"] = password
-    # env["DB_DSN"] = config["database"]["default_dsn"]  # если нужно переопределить
+    # env["DB_DSN"] = ...  # если нужно переопределить — берётся из config в тестах
     
     allure_results = config["allure"]["results_dir"]
     os.makedirs(allure_results, exist_ok=True)
     
-    print("\nЗапуск pytest...\n")
+    print("\nЗапускаю pytest на всех тестах ветки...\n")
     
     try:
+        cmd = [
+            "pytest",
+            "--alluredir", allure_results,
+            os.path.join(tests_dir, "*.py")   # запуск всех .py файлов в директории
+        ]
+        
         result = subprocess.run(
-            [
-                "pytest",
-                "--alluredir", allure_results,
-                full_test_path
-            ],
+            cmd,
             env=env,
             capture_output=True,
-            text=True
+            text=True,
+            cwd=repo_path   # важно — pytest запускается из корня репозитория
         )
         
         print(result.stdout)
@@ -77,14 +127,15 @@ def main():
             print("\nstderr:\n" + result.stderr)
         
         print(f"\nКод возврата: {result.returncode}")
-        print("OK ✓" if result.returncode == 0 else "Провал ✗")
+        print("Все тесты пройдены ✓" if result.returncode == 0 else "Есть проваленные тесты ✗")
         
-        print(f"\nПросмотр отчёта: allure serve {allure_results}")
+        print(f"\nПросмотр Allure-отчёта:")
+        print(f"  allure serve {allure_results}")
     
     except FileNotFoundError:
-        print("pytest не найден → pip install pytest allure-pytest")
+        print("pytest не найден → выполните: pip install pytest allure-pytest")
     except Exception as e:
-        print(f"Ошибка запуска: {e}")
+        print(f"Ошибка при запуске pytest: {e}")
 
 if __name__ == "__main__":
     main()
