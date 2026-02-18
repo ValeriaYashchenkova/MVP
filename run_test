@@ -1,8 +1,7 @@
 # run_test.py
 import os
 import sys
-import subprocess
-import getpass
+import oracledb
 import keyring
 import git
 import datetime
@@ -50,33 +49,26 @@ def checkout_and_pull_branch(repo, branch_name, default_branch):
     print(f"→ pull origin/{branch_name}")
     repo.git.pull('origin', branch_name)
 
-def parse_pytest_output(output):
-    """Простой парсер вывода pytest для извлечения результатов"""
-    lines = output.splitlines()
-    results = []
-    current_test = None
+def run_sql_file(db_user, db_pass, dsn, sql_path):
+    try:
+        conn = oracledb.connect(user=db_user, password=db_pass, dsn=dsn)
+        cursor = conn.cursor()
+        with open(sql_path, 'r', encoding='utf-8') as f:
+            sql = f.read()
+        cursor.execute(sql)
+        rows = cursor.fetchall()
+        conn.close()
+        
+        if len(rows) == 0:
+            return "OK", "Дубликатов не найдено", ""
+        else:
+            details = []
+            for row in rows:
+                details.append(str(row))
+            return "FAILED", f"Найдено {len(rows)} наборов дубликатов", "\n".join(details)
     
-    for line in lines:
-        line = line.strip()
-        if line.startswith("test_") and "::" in line:
-            current_test = line.split("::")[-1].split()[0]
-        elif line.startswith("PASSED") and current_test:
-            results.append({"name": current_test, "status": "PASSED", "message": ""})
-            current_test = None
-        elif line.startswith("FAILED") and current_test:
-            # ищем сообщение об ошибке (следующая строка часто содержит детали)
-            msg = ""
-            for next_line in lines[lines.index(line)+1:]:
-                if next_line.strip() and not next_line.startswith(" "):
-                    break
-                msg += next_line.strip() + " "
-            results.append({"name": current_test, "status": "FAILED", "message": msg.strip()})
-            current_test = None
-        elif line.startswith("ERROR") and current_test:
-            results.append({"name": current_test, "status": "ERROR", "message": "Ошибка выполнения"})
-            current_test = None
-    
-    return results
+    except oracledb.Error as e:
+        return "ERROR", "Ошибка выполнения", str(e)
 
 def generate_html_report(results, branch_name):
     timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -86,37 +78,39 @@ def generate_html_report(results, branch_name):
     <meta charset="UTF-8">
     <title>Отчёт по проверке дубликатов — {branch_name}</title>
     <style>
-        body {{ font-family: Arial, sans-serif; margin: 40px; }}
-        h1 {{ color: #333; }}
-        table {{ border-collapse: collapse; width: 100%; max-width: 900px; }}
-        th, td {{ border: 1px solid #ddd; padding: 12px; text-align: left; }}
-        th {{ background-color: #f2f2f2; }}
-        .passed {{ background-color: #d4edda; color: #155724; }}
-        .failed {{ background-color: #f8d7da; color: #721c24; }}
-        .error  {{ background-color: #fff3cd; color: #856404; }}
-        pre {{ white-space: pre-wrap; font-family: monospace; }}
+        body {{ font-family: Arial, sans-serif; margin: 40px; background: #f9f9f9; }}
+        h1 {{ color: #2c3e50; }}
+        table {{ border-collapse: collapse; width: 100%; max-width: 1100px; margin-top: 20px; }}
+        th, td {{ border: 1px solid #bdc3c7; padding: 14px; text-align: left; }}
+        th {{ background: #ecf0f1; color: #34495e; }}
+        .ok    {{ background: #d4edda; color: #155724; font-weight: bold; }}
+        .fail  {{ background: #f8d7da; color: #721c24; font-weight: bold; }}
+        .error {{ background: #fff3cd; color: #856404; font-weight: bold; }}
+        pre {{ margin: 0; white-space: pre-wrap; font-family: Consolas, monospace; }}
     </style>
 </head>
 <body>
-    <h1>Отчёт по тестам на дубликаты</h1>
+    <h1>Отчёт по проверке дубликатов</h1>
     <p>Ветка: <strong>{branch_name}</strong><br>
        Дата: {timestamp}<br>
-       Всего тестов: {len(results)}</p>
+       Всего проверок: {len(results)}</p>
     
     <table>
         <tr>
-            <th>Тест</th>
+            <th>Файл скрипта</th>
             <th>Статус</th>
-            <th>Сообщение / Детали</th>
+            <th>Сообщение</th>
+            <th>Детали / Дубликаты</th>
         </tr>
 """
     for r in results:
-        cls = r["status"].lower()
-        msg = r["message"] or "—"
+        cls = {"OK": "ok", "FAILED": "fail", "ERROR": "error"}[r["status"]]
+        details = r["details"] or "—"
         html += f"""        <tr>
-            <td>{r["name"]}</td>
-            <td class="{cls}"><strong>{r["status"]}</strong></td>
-            <td><pre>{msg}</pre></td>
+            <td>{r["file"]}</td>
+            <td class="{cls}">{r["status"]}</td>
+            <td>{r["message"]}</td>
+            <td><pre>{details}</pre></td>
         </tr>\n"""
     
     html += """    </table>
@@ -129,12 +123,12 @@ def main():
     repo_path = config["repository"]["local_path"]
     
     if not os.path.exists(repo_path):
-        print("Репозиторий не найден. Запустите generate_test.py сначала.")
+        print("Репозиторий не найден. Запустите generate_test.py")
         sys.exit(1)
     
     repo = git.Repo(repo_path)
     
-    print("=== Запуск тестов и генерация простого отчёта ===\n")
+    print("=== Проверка дубликатов по SQL-скриптам ===\n")
     
     branch_name = input("Название ветки: ").strip()
     if not branch_name:
@@ -144,57 +138,46 @@ def main():
     
     tests_dir = os.path.join(repo_path, config["tests"]["tests_directory"])
     if not os.path.exists(tests_dir):
-        print(f"Папка тестов не найдена: {tests_dir}")
+        print(f"Папка {tests_dir} не найдена")
         return
     
-    user, password = get_db_credentials(config)
+    sql_files = [f for f in os.listdir(tests_dir) if f.endswith('.sql')]
+    if not sql_files:
+        print(f"SQL-скрипты не найдены в {tests_dir}")
+        return
     
-    env = os.environ.copy()
-    env["DB_USER"] = user
-    env["DB_PASS"] = password
+    print(f"Найдено скриптов: {len(sql_files)}")
+    for f in sql_files:
+        print(f"  • {f}")
     
-    print("\nЗапускаю pytest...\n")
+    db_user, db_pass = get_db_credentials(config)
+    dsn = config["database"]["default_dsn"]
     
-    try:
-        result = subprocess.run(
-            ["pytest", tests_dir],
-            env=env,
-            capture_output=True,
-            text=True,
-            cwd=repo_path
-        )
-        
-        print(result.stdout)
-        if result.stderr:
-            print("\nОшибки/логи:\n" + result.stderr)
-        
-        print(f"\nКод возврата: {result.returncode}")
-        
-        # Парсим результаты
-        test_results = parse_pytest_output(result.stdout + "\n" + result.stderr)
-        
-        if not test_results:
-            print("Не удалось распознать результаты тестов (возможно, pytest упал слишком рано)")
-            print("Сохраняем сырой вывод в raw_output.txt")
-            with open("raw_output.txt", "w", encoding="utf-8") as f:
-                f.write(result.stdout + "\n\n" + result.stderr)
-            return
-        
-        # Генерируем HTML
-        html_content = generate_html_report(test_results, branch_name)
-        report_path = "test_report.html"
-        
-        with open(report_path, "w", encoding="utf-8") as f:
-            f.write(html_content)
-        
-        print(f"\nОтчёт сохранён: {report_path}")
-        print("Открываю в браузере...")
-        webbrowser.open(f"file://{os.path.abspath(report_path)}")
+    results = []
     
-    except FileNotFoundError:
-        print("pytest не найден → pip install pytest")
-    except Exception as e:
-        print(f"Ошибка при запуске: {e}")
+    print("\nВыполняю проверки...\n")
+    
+    for sql_file in sql_files:
+        sql_path = os.path.join(tests_dir, sql_file)
+        print(f"→ {sql_file} ... ", end="")
+        status, message, details = run_sql_file(db_user, db_pass, dsn, sql_path)
+        results.append({
+            "file": sql_file,
+            "status": status,
+            "message": message,
+            "details": details
+        })
+        print(status)
+    
+    html_content = generate_html_report(results, branch_name)
+    report_path = os.path.join(os.path.dirname(__file__), f"report_{branch_name.replace('/', '_')}.html")
+    
+    with open(report_path, "w", encoding="utf-8") as f:
+        f.write(html_content)
+    
+    print(f"\nОтчёт сохранён: {report_path}")
+    print("Открываю в браузере...")
+    webbrowser.open(f"file:///{os.path.abspath(report_path)}")
 
 if __name__ == "__main__":
     main()
