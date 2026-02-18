@@ -1,4 +1,7 @@
 # generate_test.py
+data-tests-framework/
+├── generate_test.py       # 1. Генерирует тест → коммитит → пушит в новую/существующую ветку
+└── run_test.py            # 2. Запускает конкретный тест(ы) на указанной БД (с Allure)
 import os
 import sys
 import getpass
