@@ -1,38 +1,42 @@
-data-tests-framework/
-├── generate_test.py       # 1. Генерирует тест → коммитит → пушит в новую/существующую ветку
-└── run_test.py            # 2. Запускает конкретный тест(ы) на указанной БД (с Allure)
-
 # generate_test.py
 import os
+import sys
 import getpass
 import git
 import keyring
+try:
+    import tomllib  # Python 3.11+
+except ImportError:
+    import tomli as tomllib  # pip install tomli
 
-# ──────────────────────────────────────────────
-# Константы
-# ──────────────────────────────────────────────
-REPO_URL = "https://git.moscow.alfaintra.net/scm/bialm_ft/bialm_ft_auto.git"
-LOCAL_REPO_PATH = "./bialm_ft_auto"
-GIT_SERVICE = "bitbucket_auto_tests"
-DEFAULT_BRANCH = "master"
+CONFIG_FILE = "config.toml"
+
+def load_config():
+    if not os.path.exists(CONFIG_FILE):
+        print(f"Конфиг-файл {CONFIG_FILE} не найден!")
+        sys.exit(1)
+    with open(CONFIG_FILE, "rb") as f:
+        return tomllib.load(f)
 
 def get_credentials(service):
     username = keyring.get_password(service, "username")
     password = keyring.get_password(service, "password")
     
     if not username:
-        username = input(f"Логин Bitbucket ({service}): ")
+        username = input(f"Логин {service}: ")
         keyring.set_password(service, "username", username)
     
     if not password:
-        password = getpass.getpass(f"Пароль Bitbucket ({service}): ")
+        password = getpass.getpass(f"Пароль {service}: ")
         keyring.set_password(service, "password", password)
     
     return username, password
 
-def generate_test_py_content(schema, table_name, keys_str):
+def generate_test_py_content(schema, table_name, keys_str, config):
     keys_list = [k.strip() for k in keys_str.split(',')]
     group_by = ', '.join(keys_list)
+    
+    dsn = config["database"]["default_dsn"]
     
     content = f'''\
 import os
@@ -40,11 +44,11 @@ import pytest
 import allure
 import oracledb
 
-DB_DSN = os.getenv("DB_DSN", "(DESCRIPTION=(ADDRESS=(PROTOCOL=TCP)(HOST=VMDWH12)(PORT=1521))(CONNECT_DATA=(SERVICE_NAME=ALMTST1)))")
+DB_DSN = os.getenv("DB_DSN", "{dsn}")
 
 @allure.title("Проверка дубликатов в таблице {table_name}")
 @allure.description("Ключи: {group_by}")
-def test_no_duplicates_in_{table_name.replace('.', '_')}():
+def test_no_duplicates_{table_name.lower().replace('.', '_')}():
     user = os.getenv("DB_USER")
     password = os.getenv("DB_PASS")
     
@@ -66,50 +70,56 @@ HAVING COUNT(*) > 1
         cursor.execute(sql)
         rows = cursor.fetchall()
     
-    with allure.step("Проверка результата"):
+    with allure.step("Анализ результата"):
         if rows:
             for row in rows:
                 allure.attach(str(row), name="Дубликат", attachment_type=allure.attachment_type.TEXT)
             pytest.fail(f"Найдено {{len(rows)}} наборов дубликатов")
         else:
-            allure.step("Дубликатов не обнаружено")
+            allure.step("Дубликатов не обнаружено → OK")
     
     conn.close()
 '''
     return content.strip()
 
 def main():
+    config = load_config()
+    
     print("=== Генерация теста на дубликаты ===\n")
     
     schema = input("Схема: ").strip()
     table_name = input("Таблица: ").strip()
-    keys = input("Ключи через запятую: ").strip()
+    keys = input("Ключи (через запятую): ").strip()
     
-    test_content = generate_test_py_content(schema, table_name, keys)
+    test_content = generate_test_py_content(schema, table_name, keys, config)
     
-    test_filename = f"test_duplicates_{table_name.lower().replace('.', '_')}.py"
-    relative_path = f"tests/{test_filename}"
-    full_path = os.path.join(LOCAL_REPO_PATH, relative_path)
+    tests_dir = config["tests"]["tests_directory"]
+    prefix = config["tests"]["test_file_prefix"]
+    ext = config["tests"]["file_extension"]
+    filename = f"{prefix}{table_name.lower().replace('.', '_')}{ext}"
+    relative_path = f"{tests_dir}/{filename}"
+    full_path = os.path.join(config["repository"]["local_path"], relative_path)
     
-    branch_name = input("\nИмя ветки (feature/... или bugfix/...): ").strip()
+    branch_name = input("\nИмя ветки: ").strip()
     
-    print("\nСгенерированный код теста:\n" + "="*60)
+    print("\nСгенерированный тест:\n" + "="*70)
     print(test_content)
-    print("="*60)
+    print("="*70)
     
-    confirm = input("\nСохранить и запушить? [y/N]: ").lower().startswith('y')
-    if not confirm:
-        return
+    if config["behavior"].get("confirm_before_push", True):
+        if not input("\nЗапушить в репозиторий? [y/N]: ").lower().startswith('y'):
+            return
     
-    # ─── Git операции ────────────────────────────────────────
-    git_user, git_pass = get_credentials(GIT_SERVICE)
+    # ─── Git ────────────────────────────────────────────────
+    git_user, git_pass = get_credentials(config["repository"]["git_service_name"])
     
-    if not os.path.exists(LOCAL_REPO_PATH):
-        auth_url = f"https://{git_user}:{git_pass}@{REPO_URL.split('https://')[1]}"
-        git.Repo.clone_from(auth_url, LOCAL_REPO_PATH)
+    repo_path = config["repository"]["local_path"]
+    if not os.path.exists(repo_path):
+        auth_url = f"https://{git_user}:{git_pass}@{config['repository']['url'].split('https://')[1]}"
+        git.Repo.clone_from(auth_url, repo_path)
         print("Репозиторий склонирован")
     
-    repo = git.Repo(LOCAL_REPO_PATH)
+    repo = git.Repo(repo_path)
     
     os.makedirs(os.path.dirname(full_path), exist_ok=True)
     with open(full_path, 'w', encoding='utf-8') as f:
@@ -117,9 +127,8 @@ def main():
     
     repo.remotes.origin.fetch()
     
-    # Авто-stash если нужно
-    if repo.is_dirty() or repo.untracked_files:
-        print("→ Автоматический stash текущих изменений")
+    if config["behavior"].get("auto_stash", True) and (repo.is_dirty() or repo.untracked_files):
+        print("→ Авто-stash")
         repo.git.stash('push', '-m', f"auto-stash before {branch_name}")
     
     remote_branches = {ref.name.split('/')[-1] for ref in repo.remotes.origin.refs}
@@ -128,16 +137,16 @@ def main():
         repo.git.checkout(branch_name)
         repo.git.pull('origin', branch_name)
     else:
-        repo.git.checkout(DEFAULT_BRANCH)
-        repo.git.pull('origin', DEFAULT_BRANCH)
+        repo.git.checkout(config["repository"]["default_branch"])
+        repo.git.pull('origin', config["repository"]["default_branch"])
         repo.git.checkout('-b', branch_name)
     
     repo.git.add(relative_path)
-    repo.index.commit(f"Add duplicate check test for {schema}.{table_name}")
+    repo.index.commit(f"Add duplicate check: {schema}.{table_name}")
     repo.git.push('--set-upstream', 'origin', branch_name)
     
-    print(f"\nГотово! Тест добавлен в ветку → {branch_name}")
-    print(f"Путь в репозитории: {relative_path}")
+    print(f"\nГотово! Тест в ветке: {branch_name}")
+    print(f"Файл: {relative_path}")
 
 if __name__ == "__main__":
     main()
