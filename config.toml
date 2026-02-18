@@ -1,22 +1,16 @@
-# config.toml — основной конфигурационный файл фреймворка
-
 [repository]
 url = "https://git.moscow.alfaintra.net/scm/bialm_ft/bialm_ft_auto.git"
 local_path = "./bialm_ft_auto"
 default_branch = "master"
-git_service_name = "bitbucket_auto_tests"      # имя сервиса в keyring для git-логин/пароль
+git_service_name = "bitbucket_auto_tests"
 
 [database]
-default_dsn = "BIDBTST1:1521/DB12TST2"
-db_service_name = "oracle_almtst1"             # имя сервиса в keyring для db-логин/пароль
+default_dsn = "BIDBTST1:1521/DB12TST2"          # или полный DESCRIPTION
+db_service_name = "oracle_db_tests"
 
 [tests]
 tests_directory = "tests"
-test_file_prefix = "test_duplicates_"
-file_extension = ".py"
-
-[allure]
-results_dir = "./allure-results"
+test_file_prefix = "check_duplicates_"
 
 [behavior]
 auto_stash = true
