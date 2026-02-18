@@ -1,0 +1,80 @@
+# run_test.py
+import os
+import subprocess
+import getpass
+import keyring
+
+DB_SERVICE = "oracle_almtst1"
+
+def get_db_credentials():
+    user = keyring.get_password(DB_SERVICE, "username")
+    password = keyring.get_password(DB_SERVICE, "password")
+    
+    if not user:
+        user = input("Логин БД: ")
+        keyring.set_password(DB_SERVICE, "username", user)
+    
+    if not password:
+        password = getpass.getpass("Пароль БД: ")
+        keyring.set_password(DB_SERVICE, "password", password)
+    
+    return user, password
+
+def main():
+    print("=== Запуск теста на дубликаты ===\n")
+    
+    test_file = input("Имя файла теста (tests/test_duplicates_....py): ").strip()
+    if not test_file.startswith("tests/"):
+        test_file = f"tests/{test_file}"
+    
+    full_test_path = os.path.join("./bialm_ft_auto", test_file)
+    
+    if not os.path.exists(full_test_path):
+        print(f"Файл не найден: {full_test_path}")
+        return
+    
+    user, password = get_db_credentials()
+    
+    env = os.environ.copy()
+    env["DB_USER"] = user
+    env["DB_PASS"] = password
+    # env["DB_DSN"] = "..."  # если нужно переопределить DSN
+    
+    allure_results = "./allure-results"
+    os.makedirs(allure_results, exist_ok=True)
+    
+    print("\nЗапускаю pytest...\n")
+    
+    try:
+        result = subprocess.run(
+            [
+                "pytest",
+                "--alluredir", allure_results,
+                full_test_path
+            ],
+            env=env,
+            capture_output=True,
+            text=True
+        )
+        
+        print(result.stdout)
+        if result.stderr:
+            print("\nОшибки/логи stderr:")
+            print(result.stderr)
+        
+        print(f"\nКод возврата: {result.returncode}")
+        if result.returncode == 0:
+            print("Тест пройден ✓")
+        else:
+            print("Тест НЕ пройден ✗")
+        
+        print("\nЧтобы посмотреть отчёт:")
+        print("  allure serve ./allure-results")
+    
+    except FileNotFoundError:
+        print("pytest не найден. Установите:  pip install pytest allure-pytest")
+    except Exception as e:
+        print(f"Ошибка при запуске: {e}")
+
+if __name__ == "__main__":
+    main()
