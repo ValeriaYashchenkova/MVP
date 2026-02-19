@@ -112,8 +112,11 @@ def create_allure_results(results, branch_name):
                 f.write(r["details"])
 
 def upload_to_testops(allure_results_dir, config, skip_upload=False):
+    """
+    Загружает allure-results в Allure TestOps через правильный эндпоинт /api/launch/upload
+    """
     if skip_upload:
-        print("Режим без загрузки: zip создан, но не отправлен")
+        print("Режим без загрузки: zip создан, отправка пропущена")
         return True
     
     project_id = config.get("testops", {}).get("project_id")
@@ -121,19 +124,15 @@ def upload_to_testops(allure_results_dir, config, skip_upload=False):
     base_url = config.get("testops", {}).get("url", "https://testops.moscow.alfaintra.net")
     
     if not project_id or not token:
-        print("Ошибка: в config.toml отсутствует секция [testops] или поля project_id / launch_token")
-        print("Пример:")
-        print("[testops]")
-        print("url = \"https://testops.moscow.alfaintra.net\"")
-        print("project_id = \"643\"")
-        print("launch_token = \"0d4304a3-92d6-4d7a-99ac-69a41c52af7f\"")
+        print("Ошибка: в config.toml нет [testops] или полей project_id / launch_token")
         return False
     
     zip_path = "allure-results.zip"
     
-    print(f"Архивирую папку {allure_results_dir} → {zip_path}")
+    print(f"Архивирую {allure_results_dir} → {zip_path}")
     
     try:
+        # Создаём zip
         with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED) as zipf:
             for root, _, files in os.walk(allure_results_dir):
                 for file in files:
@@ -142,12 +141,13 @@ def upload_to_testops(allure_results_dir, config, skip_upload=False):
                     zipf.write(file_path, arcname)
                     print(f"  + {arcname}")
         
-        url = f"{base_url}/api/rs/import/launch"
+        # Подготовка запроса
+        url = f"{base_url}/api/launch/upload"
         headers = {"Authorization": f"Api-Token {token}"}
         params = {"projectId": project_id}
         
         print(f"\nОтправка на: {url}")
-        print(f"projectId: {project_id}")
+        print(f"Параметры: projectId={project_id}")
         
         with open(zip_path, "rb") as zip_file:
             files = {"file": ("allure-results.zip", zip_file, "application/zip")}
@@ -157,47 +157,46 @@ def upload_to_testops(allure_results_dir, config, skip_upload=False):
                 headers=headers,
                 params=params,
                 files=files,
-                timeout=90,
-                verify=False  # отключаем проверку сертификата (self-signed в корпоративной сети)
+                timeout=120,
+                verify=False  # отключаем проверку сертификата (self-signed)
             )
         
         response.raise_for_status()
         
         data = response.json()
-        launch_url = data.get("launchUrl") or data.get("url") or "ссылка не получена"
+        launch_url = data.get("launchUrl") or data.get("url") or data.get("location", "ссылка не получена")
         
         print("\n=== УСПЕХ ===")
-        print(f"Результаты загружены в TestOps")
+        print("Результаты загружены в TestOps")
         print(f"Ссылка на запуск: {launch_url}")
         return True
         
     except requests.exceptions.SSLError as ssl_err:
         print("\nSSL-ошибка:", ssl_err)
-        print("verify=False уже включён — если не помогает, нужен корпоративный CA-сертификат")
+        print("verify=False уже включён. Если не помогает — нужен CA-сертификат банка.")
         return False
         
-    except requests.exceptions.RequestException as req_err:
-        print("\nОшибка HTTP-запроса:", req_err)
-        if 'response' in locals():
-            print(f"Код ответа: {response.status_code}")
-            print("Текст ответа:", response.text)
+    except requests.exceptions.HTTPError as http_err:
+        print(f"\nHTTP-ошибка: {http_err}")
+        print(f"Код: {response.status_code}")
+        print("Ответ сервера:", response.text)
         return False
         
     except Exception as e:
-        print("\nНеизвестная ошибка:", str(e))
+        print("\nНеизвестная ошибка при загрузке:", str(e))
         return False
         
     finally:
         # Безопасное удаление zip
         if os.path.exists(zip_path):
-            for _ in range(3):  # пробуем 3 раза с задержкой
+            for attempt in range(3):
                 try:
-                    time.sleep(0.5)
+                    time.sleep(0.5 * attempt)
                     os.remove(zip_path)
-                    print(f"Zip-файл удалён: {zip_path}")
+                    print(f"Zip удалён: {zip_path}")
                     break
                 except PermissionError:
-                    print(f"Zip занят, ждём... ({_ + 1}/3)")
+                    print(f"Zip занят ({attempt+1}/3)...")
                 except Exception as rm_err:
                     print(f"Не удалось удалить zip: {rm_err}")
                     break
