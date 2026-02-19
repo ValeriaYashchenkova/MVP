@@ -1,0 +1,113 @@
+pipeline {
+    agent {
+        kubernetes {
+            inheritFrom 'python'
+            defaultContainer 'python-builder'
+        }
+    }
+
+    // Триггеры: запуск при изменениях в репозитории
+    triggers {
+        pollSCM('')  // следит за изменениями в Bitbucket
+        // Если хочешь запускать вручную или по cron — добавь:
+        // cron('H/30 * * * *')  // каждые 30 минут
+    }
+
+    options {
+        buildDiscarder(logRotator(numToKeepStr: '20'))
+        timeout(time: 30, unit: 'MINUTES')  // таймаут билда 30 минут
+    }
+
+    parameters {
+        string(
+            name: 'BRANCH',
+            defaultValue: 'master',
+            description: 'Ветка для проверки дубликатов (например feature/duplicates-test)'
+        )
+    }
+
+    environment {
+        PATH = "/var/lib/jenkins/.local/bin:$PATH"
+        ALLURE_RESULTS = "allure-results"
+        TESTOPS_ENDPOINT = 'https://testops.moscow.alfaintra.net'
+        TESTOPS_PROJECT_ID = '643'
+        TESTOPS_SERVER_ID = 'testops'  // ID сервера из твоего Jenkins
+        // Credentials уже есть: testops-token
+    }
+
+    stages {
+        stage('Checkout SCM') {
+            steps {
+                checkout([
+                    $class: 'GitSCM',
+                    branches: [[name: "${params.BRANCH}"]],
+                    userRemoteConfigs: [[
+                        url: 'https://git.moscow.alfaintra.net/scm/bialm_ft/bialm_ft_auto.git',
+                        credentialsId: 'login_password_for_repo_bitbucket'
+                    ]]
+                ])
+            }
+        }
+
+        stage('Prepare Environment') {
+            steps {
+                sh '''
+                    python -m venv venv || true
+                    . venv/bin/activate
+                    pip install --upgrade pip
+                    pip install oracledb gitpython requests tomli
+                '''
+            }
+        }
+
+        stage('Run Duplicate Checks') {
+            steps {
+                withCredentials([string(credentialsId: 'testops-token', variable: 'ALLURE_LAUNCH_TOKEN')]) {
+                    sh '''
+                        . venv/bin/activate
+                        rm -rf ${ALLURE_RESULTS}
+                        mkdir -p ${ALLURE_RESULTS}
+                        python run_test.py --branch ${BRANCH}
+                    '''
+                }
+            }
+        }
+    }
+
+    post {
+        always {
+            // 1. Публикуем отчёт локально в Jenkins (через Allure плагин)
+            allure([
+                includeProperties: false,
+                reportBuildPolicy: 'ALWAYS',
+                results: [[path: "${ALLURE_RESULTS}"]]
+            ])
+
+            // 2. Загружаем в Allure TestOps (используем существующий withAllureUpload)
+            script {
+                try {
+                    echo "Uploading results to Allure TestOps..."
+                    withAllureUpload(
+                        credentialsId: 'testops-token',
+                        name: "Duplicate Checks #${BUILD_NUMBER} | ${BRANCH}",
+                        projectId: '643',
+                        results: [[path: "${WORKSPACE}/allure-results"]],
+                        serverId: 'testops',
+                        tags: "${BRANCH}, sql-duplicates"
+                    ) {
+                        echo "Allure TestOps upload completed"
+                    }
+                } catch (Exception e) {
+                    echo "Failed to upload to Allure TestOps: ${e}"
+                    // Не падаем билд, если TestOps недоступен
+                }
+            }
+
+            // 3. Архивация результатов
+            archiveArtifacts artifacts: "${ALLURE_RESULTS}/**", allowEmptyArchive: true
+
+            // 4. Очистка workspace
+            cleanWs()
+        }
+    }
+}
