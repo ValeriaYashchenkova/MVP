@@ -17,7 +17,7 @@ CONFIG_FILE = "config.toml"
 
 def load_config():
     if not os.path.exists(CONFIG_FILE):
-        print(f"Конфиг {CONFIG_FILE} не найден!")
+        print(f"Конфиг {CONFIG_FILE} не найден! Создай его с токеном.")
         sys.exit(1)
     with open(CONFIG_FILE, "rb") as f:
         return tomllib.load(f)
@@ -88,7 +88,7 @@ def create_allure_results(results, branch_name):
         test_uuid = str(uuid4())
         test_file = os.path.join(allure_dir, f"{test_uuid}-result.json")
         
-        status_map = {"OK": "passed", "FAILED": "failed", "ERROR": "broken"}
+        status_map = {"passed": "passed", "failed": "failed", "broken": "broken"}
         
         with open(test_file, 'w', encoding='utf-8') as f:
             json.dump({
@@ -97,7 +97,10 @@ def create_allure_results(results, branch_name):
                 "status": status_map.get(r["status"], "broken"),
                 "steps": [{"name": "Выполнение SQL", "status": status_map.get(r["status"], "broken")}],
                 "attachments": [{"name": "Детали", "source": f"{test_uuid}-attachment.txt", "type": "text/plain"} if r["details"] else []],
-                "labels": [{"name": "branch", "value": branch_name}],
+                "labels": [
+                    {"name": "branch", "value": branch_name},
+                    {"name": "framework", "value": "sql-duplicates-check"}
+                ],
                 "uuid": test_uuid,
                 "start": int(datetime.datetime.now().timestamp() * 1000),
                 "stop": int(datetime.datetime.now().timestamp() * 1000)
@@ -110,7 +113,11 @@ def create_allure_results(results, branch_name):
 
 def upload_to_testops(allure_results_dir, config):
     project_id = config["testops"]["project_id"]
-    token = config["testops"]["launch_token"] or input("Введите Launch Token: ").strip()
+    token = config["testops"]["launch_token"]
+    
+    if not token:
+        print("Launch Token не найден в config.toml. Добавь его в секцию [testops]")
+        sys.exit(1)
     
     zip_path = "allure-results.zip"
     with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED) as zipf:
@@ -120,7 +127,7 @@ def upload_to_testops(allure_results_dir, config):
     
     url = f"{config['testops']['url']}/api/rs/import/launch"
     headers = {"Authorization": f"Api-Token {token}"}
-    files = {"file": open(zip_path, "rb")}
+    files = {"file": ("allure-results.zip", open(zip_path, "rb"), "application/zip")}
     params = {"projectId": project_id}
     
     print("\nЗагружаю результаты в Allure TestOps...")
@@ -129,7 +136,7 @@ def upload_to_testops(allure_results_dir, config):
         response.raise_for_status()
         data = response.json()
         launch_url = data.get("launchUrl", "")
-        print(f"Успешно загружено! Ссылка: {launch_url}")
+        print(f"Успешно загружено! Ссылка на запуск: {launch_url}")
     except requests.exceptions.RequestException as e:
         print("Ошибка загрузки:", e)
         if 'response' in locals():
@@ -139,7 +146,7 @@ def upload_to_testops(allure_results_dir, config):
             os.remove(zip_path)
 
 def main():
-    parser = argparse.ArgumentParser()
+    parser = argparse.ArgumentParser(description="Запуск проверки дубликатов по SQL-скриптам")
     parser.add_argument('--branch', help='Название ветки (опционально)')
     args = parser.parse_args()
 
@@ -159,7 +166,7 @@ def main():
     sql_files = [f for f in os.listdir(tests_dir) if f.endswith('.sql')]
     
     if not sql_files:
-        print("SQL-скрипты не найдены")
+        print("SQL-скрипты не найдены в", tests_dir)
         return
     
     db_user, db_pass = get_db_credentials(config)
