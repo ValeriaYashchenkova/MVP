@@ -111,39 +111,100 @@ def create_allure_results(results, branch_name):
             with open(attach_path, 'w', encoding='utf-8') as f:
                 f.write(r["details"])
 
-def upload_to_testops(allure_results_dir, config):
+def upload_to_testops(allure_results_dir, config, skip_upload=False):
+    """
+    Загружает папку allure-results в Allure TestOps через REST API.
+    
+    Параметры:
+        allure_results_dir (str): путь к папке с результатами Allure
+        config (dict): загруженный config.toml
+        skip_upload (bool): если True — только создаёт zip, не загружает (для теста)
+    """
     project_id = config["testops"]["project_id"]
     token = config["testops"]["launch_token"]
     
     if not token:
-        print("Launch Token не найден в config.toml. Добавь его в секцию [testops]")
-        sys.exit(1)
+        print("Launch Token не найден в config.toml [testops].")
+        print("Добавь строку: launch_token = \"твой_токен\"")
+        return False
     
     zip_path = "allure-results.zip"
-    with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED) as zipf:
-        for root, _, files in os.walk(allure_results_dir):
-            for file in files:
-                zipf.write(os.path.join(root, file), os.path.relpath(os.path.join(root, file), allure_results_dir))
     
-    url = f"{config['testops']['url']}/api/rs/import/launch"
-    headers = {"Authorization": f"Api-Token {token}"}
-    files = {"file": ("allure-results.zip", open(zip_path, "rb"), "application/zip")}
-    params = {"projectId": project_id}
+    print(f"Создаю архив из папки: {allure_results_dir}")
     
-    print("\nЗагружаю результаты в Allure TestOps...")
     try:
-        response = requests.post(url, headers=headers, params=params, files=files, timeout=60)
+        # Создаём zip-архив
+        with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED) as zipf:
+            for root, _, files in os.walk(allure_results_dir):
+                for file in files:
+                    file_path = os.path.join(root, file)
+                    arcname = os.path.relpath(file_path, allure_results_dir)
+                    zipf.write(file_path, arcname)
+                    print(f"  добавлен: {arcname}")
+        
+        if skip_upload:
+            print(f"Тестовый режим: zip создан, загрузка пропущена → {zip_path}")
+            return True
+        
+        # Подготовка запроса
+        url = f"{config['testops']['url']}/api/rs/import/launch"
+        headers = {"Authorization": f"Api-Token {token}"}
+        params = {"projectId": project_id}
+        
+        print(f"Отправляю POST-запрос на: {url}")
+        print(f"Параметры: projectId={project_id}")
+        
+        with open(zip_path, "rb") as zip_file:
+            files = {"file": (zip_path, zip_file, "application/zip")}
+            
+            response = requests.post(
+                url,
+                headers=headers,
+                params=params,
+                files=files,
+                timeout=90,               # увеличил таймаут
+                verify=False              # отключаем проверку сертификата (корпоративный self-signed)
+            )
+        
         response.raise_for_status()
+        
         data = response.json()
-        launch_url = data.get("launchUrl", "")
-        print(f"Успешно загружено! Ссылка на запуск: {launch_url}")
-    except requests.exceptions.RequestException as e:
-        print("Ошибка загрузки:", e)
+        launch_url = data.get("launchUrl", data.get("url", "ссылка не получена"))
+        
+        print(f"\nУСПЕХ! Результаты загружены в TestOps")
+        print(f"Ссылка на запуск: {launch_url}")
+        return True
+        
+    except requests.exceptions.SSLError as ssl_err:
+        print("\nSSL-ошибка (сертификат):", ssl_err)
+        print("Уже используется verify=False — возможно, нужен корпоративный CA-сертификат.")
+        print("Если не критично — можно игнорировать для тестов.")
+        return False
+        
+    except requests.exceptions.RequestException as req_err:
+        print("\nОшибка сети / HTTP:", req_err)
         if 'response' in locals():
-            print(response.text)
+            print(f"Статус: {response.status_code}")
+            print("Ответ сервера:", response.text)
+        return False
+        
+    except Exception as e:
+        print("\nНеизвестная ошибка при загрузке:", str(e))
+        return False
+        
     finally:
+        # Безопасное удаление zip-файла
         if os.path.exists(zip_path):
-            os.remove(zip_path)
+            try:
+                # На случай, если файл всё ещё открыт — даём время
+                import time
+                time.sleep(0.5)
+                os.remove(zip_path)
+                print(f"Временный zip удалён: {zip_path}")
+            except PermissionError:
+                print(f"Не удалось удалить {zip_path} — файл занят. Удали вручную.")
+            except Exception as rm_err:
+                print(f"Ошибка удаления zip: {rm_err}")
 
 def main():
     parser = argparse.ArgumentParser(description="Запуск проверки дубликатов по SQL-скриптам")
